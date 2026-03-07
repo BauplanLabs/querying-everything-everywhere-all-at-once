@@ -1,0 +1,17 @@
+project:
+  id: e96ae6c1-faf4-47c9-990d-0b7ff1fa79f7
+  name: v_100m_py_gb
+
+parameters:
+  cutoff_date:
+    type: str
+    default: "2019-10-24"
+    description: End of observation window (exclusive). Features are computed from events before this date.
+  label_end_date:
+    type: str
+    default: "2019-10-31"
+    description: End of label window (inclusive). Users who purchase in [cutoff, label_end] are labeled as converters.
+  size:
+    type: int
+    default: 0
+    description: Max rows to keep in bronze layer. 0 means all rows.

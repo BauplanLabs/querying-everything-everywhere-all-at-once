@@ -1,0 +1,17 @@
+project:
+  id: 9e88b5e5-cfd7-4b1a-8616-73baf910dc94
+  name: v_15m_py_rf
+
+parameters:
+  cutoff_date:
+    type: str
+    default: "2019-10-24"
+    description: End of observation window (exclusive). Features are computed from events before this date.
+  label_end_date:
+    type: str
+    default: "2019-10-31"
+    description: End of label window (inclusive). Users who purchase in [cutoff, label_end] are labeled as converters.
+  size:
+    type: int
+    default: 0
+    description: Max rows to keep in bronze layer. 0 means all rows.
