@@ -68,6 +68,7 @@ TABLE_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 
+
 _SYSTEM_PROMPT_TEMPLATE: str = """\
 You are a Text-to-SQL translator for an e-commerce analytics system.
 
@@ -112,10 +113,17 @@ _ADHOC_RULES: str = ""
 _NATIVE_RULES: str = """
 IMPORTANT — Native engine mode:
 The user_predictions table has a hidden column called __branch_id that
-identifies which data-agent branch produced each row.  You MUST include
+identifies which data-agent branch produced each row. You MUST include
 __branch_id in your SELECT list and add GROUP BY __branch_id so the query
-returns one result row per branch.  For set queries (returning user_id rows),
+returns one result row per branch. For set queries (returning user_id rows),
 add __branch_id to the SELECT but do NOT group by it.
+
+IMPORTANT — Top-K per branch:
+If the user asks for a top-K list (e.g., "top 50 customers"), DO NOT use a
+global ORDER BY ... LIMIT k. You must return top-K per branch by ranking
+within each __branch_id using a window function:
+  ROW_NUMBER() OVER (PARTITION BY __branch_id ORDER BY <score> DESC) AS rn
+and then filtering with WHERE rn <= k.
 
 Examples:
 
