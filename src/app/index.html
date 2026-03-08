@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Query the Multiverse</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>(Querying) Everything Everywhere All at Once</h1>
+        <p id="status-line" class="status">Connecting to lakehouse...</p>
+    </header>
+
+    <main>
+        <section id="graph-section">
+            <div id="graph-container">
+                <svg id="branch-graph"></svg>
+            </div>
+        </section>
+
+        <section id="query-section">
+            <h2>Query the Multiverse</h2>
+            <div id="query-controls">
+                <div class="control-row">
+                    <label for="engine-select">Engine</label>
+                    <select id="engine-select">
+                        <option value="adhoc">Ad hoc (per-branch DataFusion)</option>
+                        <option value="native">Native (Rust TableProvider)</option>
+                    </select>
+                </div>
+                <div class="control-row">
+                    <label for="preset-select">Demo questions</label>
+                    <select id="preset-select">
+                        <option value="">Free text</option>
+                        <option value="How many customers will buy tomorrow?">Phase 2: How many customers will buy tomorrow?</option>
+                        <option value="Is tomorrow's conversion rate above 2%?">Phase 3: Is tomorrow's conversion rate above 2%?</option>
+                        <option value="How many smartphone shoppers will convert tomorrow?">Phase 4: How many smartphone shoppers will convert tomorrow?</option>
+                        <option value="Which customers should we target tomorrow? (top 50)">Phase 5: Which customers should we target tomorrow? (top 50)</option>
+                    </select>
+                </div>
+                <div class="control-row">
+                    <label for="cache-toggle">SQL cache</label>
+                    <label class="toggle-label">
+                        <input type="checkbox" id="cache-toggle" checked>
+                        <span class="toggle-text">On</span>
+                    </label>
+                </div>
+                <div class="control-row query-row">
+                    <input type="text" id="question-input"
+                           placeholder="Ask a question about user predictions...">
+                    <button id="ask-btn">Ask</button>
+                </div>
+            </div>
+            <div id="query-result" class="hidden"></div>
+        </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+[package]
+name = "multiverse_provider"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "multiverse_provider"
+crate-type = ["cdylib"]
+
+[dependencies]
+datafusion = { version = "51", default-features = false, features = ["parquet", "sql"] }
+datafusion-sql = "51"
+sqlparser = "0.58"
+datafusion-ffi = "51"
+datafusion-catalog = { version = "51", default-features = false }
+datafusion-physical-plan = "51"
+datafusion-physical-expr = "51"
+datafusion-expr = "51"
+datafusion-common = "51"
+pyo3 = { version = "0.26", features = ["extension-module", "abi3", "abi3-py310"] }
+arrow = { version = "57", features = ["pyarrow"] }
+arrow-schema = "57"
+arrow-array = "57"
+object_store = { version = "0.12", features = ["aws"] }
+parquet = { version = "57", default-features = false, features = ["arrow"] }
+url = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+pyo3-build-config = "0.26"

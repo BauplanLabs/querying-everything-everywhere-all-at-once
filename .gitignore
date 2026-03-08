@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific
+local.env
+.sql_cache/
+src/benchmarks/data/
+src/benchmarks/*.jsonl
+src/benchmarks/figures/
+.claude/
+*.tex
