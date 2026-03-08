@@ -10,7 +10,7 @@ uv sync
 echo
 echo "=== Building Rust extension ==="
 uv pip install maturin
-uv run maturin develop --manifest-path multiverse_provider/Cargo.toml
+uv run maturin develop --manifest-path multiverse_provider/Cargo.toml --release
 
 echo
 echo "=== Running benchmarks ==="

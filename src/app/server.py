@@ -137,8 +137,23 @@ async def status():
 async def branches():
     t0 = time.perf_counter()
     all_br = get_all_branches(client, username)
-    forking = find_branches_forking_from(client, head_commit["hash"], all_br)
-    forking = [b for b in forking if DEMO_BRANCH_MARKER in b["name"]]
+
+    # Find demo branches: either they have unique commits (forking) or they
+    # were just created from trunk and have no commits yet (hash == trunk HEAD).
+    demo_br = [b for b in all_br if DEMO_BRANCH_MARKER in b["name"]]
+    forking = find_branches_forking_from(client, head_commit["hash"], demo_br)
+    forking_names = {b["name"] for b in forking}
+
+    # Include branches that sit exactly on trunk HEAD (no unique commits yet —
+    # pipeline is still running on a tx branch).
+    pending = []
+    for b in demo_br:
+        if b["name"] not in forking_names and b["hash"] == head_commit["hash"]:
+            forking.append(b)
+            pending.append(b["name"])
+    if pending:
+        logger.info("Pending branches (no commits yet): %s", pending)
+
     forking.sort(key=lambda b: b["name"])
 
     result = []
@@ -151,11 +166,17 @@ async def branches():
         b["name"]: b for b in all_br_with_tx
         if TRANSACTIONAL_BRANCH_MARKER in b["name"]
     }
+    if tx_branches:
+        logger.info("Active tx branches: %s", list(tx_branches.keys()))
 
     commits_by_branch = _fetch_branch_commits(forking, head_commit["hash"])
 
     # For each DAG branch, also fetch commits from any active tx branch
     tx_commits_by_dag = _fetch_tx_commits(forking, tx_branches)
+    if tx_commits_by_dag:
+        logger.info("TX commits found for: %s", {
+            k: len(v) for k, v in tx_commits_by_dag.items()
+        })
 
     for b in forking:
         name = b["name"]
@@ -284,8 +305,11 @@ def _fetch_tx_commits(forking_branches, tx_branches):
             )
             or []
         )
-        # Only keep model materialization commits (Update/Create ICEBERG_TABLE)
-        model_commits = [c for c in raw if "ICEBERG_TABLE" in c["message"]]
+        # Only keep model materialization commits from our namespace
+        model_commits = [
+            c for c in raw
+            if "ICEBERG_TABLE" in c["message"] and NAMESPACE in c["message"]
+        ]
         model_commits.reverse()  # oldest first
         return dag_name, model_commits
 

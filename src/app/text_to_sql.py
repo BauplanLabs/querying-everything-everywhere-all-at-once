@@ -141,9 +141,14 @@ Q: "Which customers should we target tomorrow? (top 50)"
 Ad hoc SQL:
   SELECT user_id FROM user_predictions WHERE predicted_label = 1 ORDER BY conversion_prob DESC LIMIT 50
 Native SQL:
-  SELECT __branch_id, user_id FROM user_predictions WHERE predicted_label = 1 ORDER BY conversion_prob DESC LIMIT 50
+  WITH ranked AS (
+    SELECT __branch_id, user_id, ROW_NUMBER() OVER (PARTITION BY __branch_id ORDER BY conversion_prob DESC) AS rn
+    FROM user_predictions WHERE predicted_label = 1
+  )
+  SELECT __branch_id, user_id FROM ranked WHERE rn <= 50
 
 Follow this pattern: add __branch_id to SELECT, and for aggregate queries add GROUP BY __branch_id.
+For set queries with ORDER BY + LIMIT (top-K), never use a global LIMIT — use ROW_NUMBER() OVER (PARTITION BY __branch_id ...) to get top-K per branch.
 """
 
 USER_PROMPT_TEMPLATE: str = """\

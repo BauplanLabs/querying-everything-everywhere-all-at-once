@@ -148,10 +148,16 @@ def user_predictions(
     y = df["converted"].to_numpy()
 
     model = LogisticRegression(max_iter=50, class_weight="balanced")
-    model.fit(X, y)
-
-    probs = model.predict_proba(X)[:, 1]
-    preds = (probs >= 0.5).astype(int)
+    import numpy as np
+    if len(np.unique(y)) < 2:
+        # Single class — assign deterministic predictions
+        only_class = y[0]
+        probs = np.full(len(y), float(only_class))
+        preds = np.full(len(y), int(only_class))
+    else:
+        model.fit(X, y)
+        probs = model.predict_proba(X)[:, 1]
+        preds = (probs >= 0.5).astype(int)
 
     result = pl.DataFrame(
         {

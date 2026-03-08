@@ -41,35 +41,28 @@ def _write_parquet(table: pa.Table, path: Path) -> str:
     return str(path)
 
 
-# -- Mock for _register_branch (replaces S3 with local Parquet) --
+# -- Mock for _build_branch_context (replaces S3 with local Parquet) --
 
 
-def _mock_register_branch_factory(tmp_path, data_by_branch):
-    """Create a mock _register_branch that writes local Parquet and registers datasets."""
+def _mock_build_branch_context_factory(tmp_path, data_by_branch):
+    """Create a mock _build_branch_context that writes local Parquet and returns a DataFusion context."""
+    import datafusion
 
-    def _mock_register_branch(self, ctx, tables, s3_fs=None):
-        # `tables` is {table_name: metadata_location} — we ignore the metadata
-        # location and look up the Arrow table from data_by_branch instead.
-        # We need to figure out which branch this is by matching the metadata
-        # locations back to the branch.
-        for branch, branch_tables in data_by_branch.items():
-            # Check if these metadata locations match this branch
-            branch_meta = self._metadata_by_branch.get(branch, {})
-            if set(tables.values()) == set(branch_meta.values()):
-                for table_name in tables:
-                    arrow_table = branch_tables[table_name]
-                    pq_path = _write_parquet(
-                        arrow_table, tmp_path / branch / f"{table_name}.parquet"
-                    )
-                    dataset = ds.dataset(pq_path, format="parquet")
-                    ctx.register_dataset(table_name, dataset)
-                return
-        raise ValueError("Could not match tables to a branch")
+    def _mock_build_branch_context(self, branch):
+        branch_tables = data_by_branch[branch]
+        ctx = datafusion.SessionContext()
+        for table_name, arrow_table in branch_tables.items():
+            pq_path = _write_parquet(
+                arrow_table, tmp_path / branch / f"{table_name}.parquet"
+            )
+            dataset = ds.dataset(pq_path, format="parquet")
+            ctx.register_dataset(table_name, dataset)
+        return ctx
 
-    return _mock_register_branch
+    return _mock_build_branch_context
 
 
-# -- TestQueryMultiverse (end-to-end with mocked _register_branch) --
+# -- TestQueryMultiverse (end-to-end with mocked _build_branch_context) --
 
 
 class TestQueryMultiverse:
@@ -89,8 +82,8 @@ class TestQueryMultiverse:
             max_rows_hint=None,
         )
 
-        mock_fn = _mock_register_branch_factory(tmp_path, data)
-        with patch.object(NaiveMultiverse, "_register_branch", mock_fn):
+        mock_fn = _mock_build_branch_context_factory(tmp_path, data)
+        with patch.object(NaiveMultiverse, "_build_branch_context", mock_fn):
             combined, errors, meta = engine.query_multiverse(
                 "SELECT * FROM t", ["A", "B", "C"], shape=shape
             )
@@ -112,8 +105,8 @@ class TestQueryMultiverse:
         metadata = {b: {"t": f"s3://fake/{b}"} for b in data}
         engine = NaiveMultiverse(metadata)
 
-        mock_fn = _mock_register_branch_factory(tmp_path, data)
-        with patch.object(NaiveMultiverse, "_register_branch", mock_fn):
+        mock_fn = _mock_build_branch_context_factory(tmp_path, data)
+        with patch.object(NaiveMultiverse, "_build_branch_context", mock_fn):
             combined, errors, summary = engine.query_multiverse(
                 "SELECT COUNT(*) AS n FROM t", ["A", "B"]
             )
@@ -128,8 +121,8 @@ class TestQueryMultiverse:
         metadata = {"A": {"t": "s3://fake/A"}}
         engine = NaiveMultiverse(metadata)
 
-        mock_fn = _mock_register_branch_factory(tmp_path, data)
-        with patch.object(NaiveMultiverse, "_register_branch", mock_fn):
+        mock_fn = _mock_build_branch_context_factory(tmp_path, data)
+        with patch.object(NaiveMultiverse, "_build_branch_context", mock_fn):
             with pytest.raises(KeyError):
                 engine.query_multiverse("SELECT * FROM t", ["A", "B"])
 
@@ -148,8 +141,8 @@ class TestErrorHandling:
         metadata = {"only": {"t": "s3://fake/only"}}
         engine = NaiveMultiverse(metadata)
 
-        mock_fn = _mock_register_branch_factory(tmp_path, data)
-        with patch.object(NaiveMultiverse, "_register_branch", mock_fn):
+        mock_fn = _mock_build_branch_context_factory(tmp_path, data)
+        with patch.object(NaiveMultiverse, "_build_branch_context", mock_fn):
             combined, errors, summary = engine.query_multiverse(
                 "SELECT * FROM t", ["only"]
             )
@@ -165,8 +158,8 @@ class TestErrorHandling:
         metadata = {b: {"t": f"s3://fake/{b}"} for b in data}
         engine = NaiveMultiverse(metadata)
 
-        mock_fn = _mock_register_branch_factory(tmp_path, data)
-        with patch.object(NaiveMultiverse, "_register_branch", mock_fn):
+        mock_fn = _mock_build_branch_context_factory(tmp_path, data)
+        with patch.object(NaiveMultiverse, "_build_branch_context", mock_fn):
             combined, errors, summary = engine.query_multiverse(
                 "SELECT * FROM t", ["empty", "full"]
             )

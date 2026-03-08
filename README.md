@@ -14,7 +14,7 @@ The system translates natural-language business questions into SQL, executes the
 
 ![Architecture](img/architecture.jpg)
 
-The system has three layers. The **web UI** (HTML/JS/CSS) lets a business user type a natural-language question. The **core demo** layer translates the question to SQL via an LLM (OpenAI) and executes it across all data branches using one of two query engines: the *ad hoc* engine (UNION ALL rewrite over per-branch DataFusion contexts) or the *native* engine (a custom Rust DataFusion `TableProvider` that exposes every branch as a single virtual table). A **supervaluation** module then compares per-branch results and reports whether branches agree or disagree. The data layer is powered by [bauplan](https://arxiv.org/pdf/2602.02335), a cloud lakehouse with Git-like branching.
+The system has three layers. The **web UI** (HTML/JS/CSS) lets a business user type a natural-language question. The **core demo** layer translates the question to SQL via an LLM (OpenAI) and executes it across all data branches using one of two query engines: the *ad hoc* engine (runs the query independently on each branch's DataFusion context, then concatenates results) or the *native* engine (a custom Rust DataFusion `TableProvider` that exposes every branch as a single virtual table). A **supervaluation** module then compares per-branch results and reports whether branches agree or disagree. The data layer is powered by [bauplan](https://arxiv.org/pdf/2602.02335), a cloud lakehouse with Git-like branching.
 
 ## Quick start: benchmarks (no cloud account needed)
 
@@ -87,7 +87,7 @@ uv run pytest src/tests/ -v
 │   │   ├── server.py        # HTTP endpoints
 │   │   ├── text_to_sql.py   # LLM-powered question-to-SQL translation
 │   │   ├── multiverse.py    # Branch discovery and query orchestration
-│   │   ├── naive_multiverse.py   # Ad hoc engine (UNION ALL rewrite)
+│   │   ├── naive_multiverse.py   # Ad hoc engine (per-branch execution)
 │   │   ├── native_multiverse.py  # Native engine (Rust MultiverseTableProvider)
 │   │   ├── supervaluation.py     # Supervaluationary verdict computation
 │   │   ├── query_shape.py   # Result type detection (number, boolean, list)
@@ -98,7 +98,7 @@ uv run pytest src/tests/ -v
 │   ├── demo.py              # Pipeline launcher (creates branches, runs pipelines)
 │   └── tests/
 ├── multiverse_provider/     # Rust PyO3 extension (DataFusion TableProvider)
-│   ├── src/provider.rs      # MultiverseTableProvider + LocalMultiverseTable
+│   ├── src/provider.rs      # MultiverseTableProvider + query_native()
 │   └── Cargo.toml
 ├── run_demo.sh              # One-command demo launcher
 ├── stop_demo.sh             # Stop the demo
@@ -109,7 +109,7 @@ uv run pytest src/tests/ -v
 ## Limitations
 
 * **Single-column query semantics** — the supervaluation layer currently handles scalar (number, boolean) and single-column set results. Generalizing to multi-column result semantics is future work.
-* **Query parsing should be internalized in the native engine** — the current approach relies on the text-to-SQL LLM to modify the query for the native engine (the final query shape is the one we run in the benchmarks). Ideally, the engine itself would parse and rewrite arbitrary SQL to be branch-aware.
+* **Query parsing should be internalized in the native engine** — the current approach relies on the text-to-SQL LLM to modify the query for the native engine (the final query shape is the one in the benchmarks). Ideally, the engine itself would parse and rewrite arbitrary SQL to be branch-aware.
 * TBC
 
 ## License

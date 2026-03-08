@@ -8,7 +8,9 @@ name = "multiverse_provider"
 crate-type = ["cdylib"]
 
 [dependencies]
-datafusion = { version = "51", default-features = false, features = ["parquet"] }
+datafusion = { version = "51", default-features = false, features = ["parquet", "sql"] }
+datafusion-sql = "51"
+sqlparser = "0.58"
 datafusion-ffi = "51"
 datafusion-catalog = { version = "51", default-features = false }
 datafusion-physical-plan = "51"

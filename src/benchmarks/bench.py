@@ -1,12 +1,25 @@
 """
-Benchmark: ad hoc (UNION ALL) vs native multiverse engine.
+Benchmark: ad hoc (per-branch) vs native multiverse engine.
 
 Downloads parquet data from S3 if not present locally, then runs queries at
 varying branch counts to measure latency and sub-phase timing.
 
-The native engine picks the best strategy per query type:
-  - MultiverseTable (single unified query) for aggregates and JOINs
-  - Short-circuit (parallel early termination) for boolean queries
+Engine strategies
+-----------------
+Ad hoc:   Independent DataFusion SessionContext per branch, executed in a
+          ThreadPoolExecutor(max_workers=2).  Each context registers its own
+          copy of every table via register_parquet().
+
+Native:   Depends on the query type:
+          - Aggregate / JOIN: a single Rust DataFusion SessionContext with a
+            MultiverseTableProvider (UnionExec over per-branch ListingTables)
+            plus shared ListingTables.  Everything runs in one Rust process --
+            no FFI boundary -- so the optimizer has full visibility for
+            predicate pushdown, projection pruning, and shared-table reuse.
+            Exposed to Python via the query_native() PyO3 function.
+          - Boolean: parallel per-branch evaluation with early termination
+            (short-circuit).  Once two branches disagree the supervaluationary
+            verdict is determined, so remaining branches are skipped.
 
 Produces JSONL output for paper charts and a printed summary table.
 
@@ -14,6 +27,7 @@ Usage:
     uv run python src/benchmarks/bench.py
     uv run python src/benchmarks/bench.py --max-branches 16 --runs 3
     uv run python src/benchmarks/bench.py --query q2_join --engine native
+    uv run python src/benchmarks/bench.py --paper   # generate PDF charts
 """
 
 import argparse
@@ -32,30 +46,90 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 S3_BUCKET = "alpha-hello-bauplan"
-S3_PREFIX = "benchmarks/multiverse/v1"
+S3_PREFIX = "benchmarks/multiverse/v2"
 LOCAL_DATA_DIR = Path(__file__).parent / "data"
 
-# Queries: ad hoc SQL runs per-branch, native SQL runs once across all branches.
-# Native SQL uses __branch_id (injected by MultiverseTable) for grouping.
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
+# Ad hoc SQL runs per-branch (no __branch_id needed).
+# Native SQL runs once across all branches via MultiverseTableProvider,
+# which injects __branch_id; the query must GROUP BY it.
 # Boolean queries use the ad hoc SQL for short-circuit evaluation.
+#
+# Q1: Simple single-table COUNT with a filter.  Tests raw scan speed.
+#     Ad hoc wins because 50 independent small plans beat one large
+#     UnionExec plan -- the unified plan pays coordination overhead
+#     (RepartitionExec, hash partitioning for GROUP BY) that exceeds
+#     the actual work.
+#
+# Q2: JOIN between branch-specific predictions and a shared 3M-row
+#     dimension table with expensive window functions.  Native wins
+#     because it computes the CTE once and reuses the hash-join build
+#     side, while ad hoc recomputes it per branch.
+#
+# Q4: Boolean threshold.  Native uses short-circuit: once two branches
+#     disagree, the supervaluationary verdict (mixed) is determined and
+#     remaining branches are skipped.  Near-constant latency.
+# ---------------------------------------------------------------------------
+
 QUERIES = {
     "q1_count": {
-        "label": "COUNT predicted buyers (no join)",
+        "label": "COUNT predicted buyers (single table)",
         "type": "number",
-        "adhoc": "SELECT COUNT(*) AS n_buyers FROM user_predictions WHERE predicted_label = 1",
-        "native": "SELECT __branch_id, COUNT(*) AS n_buyers FROM user_predictions WHERE predicted_label = 1 GROUP BY __branch_id",
+        "adhoc": (
+            "SELECT COUNT(*) AS n_buyers "
+            "FROM user_predictions WHERE predicted_label = 1"
+        ),
+        "native": (
+            "SELECT __branch_id, COUNT(*) AS n_buyers "
+            "FROM user_predictions WHERE predicted_label = 1 "
+            "GROUP BY __branch_id"
+        ),
     },
     "q2_join": {
-        "label": "COUNT predicted buyers with JOIN on shared dimension table",
+        "label": "COUNT buyers in large segments (JOIN + window functions)",
         "type": "number",
-        "adhoc": "SELECT COUNT(*) AS n_buyers FROM ecommerce_users u JOIN user_predictions p ON u.user_id = p.user_id WHERE p.predicted_label = 1",
-        "native": "SELECT __branch_id, COUNT(*) AS n_buyers FROM ecommerce_users u JOIN user_predictions p ON u.user_id = p.user_id WHERE p.predicted_label = 1 GROUP BY __branch_id",
+        "adhoc": (
+            "WITH user_segments AS ("
+            "  SELECT user_id, customer_segment,"
+            "    COUNT(*) OVER (PARTITION BY customer_segment) AS seg_size,"
+            "    ROW_NUMBER() OVER (PARTITION BY customer_segment ORDER BY user_id) AS seg_rank"
+            "  FROM ecommerce_users"
+            ") "
+            "SELECT COUNT(*) AS n_buyers "
+            "FROM user_segments u "
+            "JOIN user_predictions p ON u.user_id = p.user_id "
+            "WHERE p.predicted_label = 1 AND u.seg_size > 50000 AND u.seg_rank <= 500000"
+        ),
+        "native": (
+            "WITH user_segments AS ("
+            "  SELECT user_id, customer_segment,"
+            "    COUNT(*) OVER (PARTITION BY customer_segment) AS seg_size,"
+            "    ROW_NUMBER() OVER (PARTITION BY customer_segment ORDER BY user_id) AS seg_rank"
+            "  FROM ecommerce_users"
+            ") "
+            "SELECT __branch_id, COUNT(*) AS n_buyers "
+            "FROM user_segments u "
+            "JOIN user_predictions p ON u.user_id = p.user_id "
+            "WHERE p.predicted_label = 1 AND u.seg_size > 50000 AND u.seg_rank <= 500000 "
+            "GROUP BY __branch_id"
+        ),
     },
     "q4_bool": {
         "label": "Boolean: is conversion rate above 2%?",
         "type": "boolean",
-        "adhoc": "SELECT CAST(SUM(CASE WHEN predicted_label = 1 THEN 1 ELSE 0 END) AS DOUBLE) / CAST(COUNT(*) AS DOUBLE) > 0.02 AS above_threshold FROM user_predictions",
-        "native": "SELECT __branch_id, CAST(SUM(CASE WHEN predicted_label = 1 THEN 1 ELSE 0 END) AS DOUBLE) / CAST(COUNT(*) AS DOUBLE) > 0.02 AS above_threshold FROM user_predictions GROUP BY __branch_id",
+        "adhoc": (
+            "SELECT CAST(SUM(CASE WHEN predicted_label = 1 THEN 1 ELSE 0 END) AS DOUBLE) "
+            "/ CAST(COUNT(*) AS DOUBLE) > 0.02 AS above_threshold "
+            "FROM user_predictions"
+        ),
+        "native": (
+            "SELECT __branch_id, "
+            "CAST(SUM(CASE WHEN predicted_label = 1 THEN 1 ELSE 0 END) AS DOUBLE) "
+            "/ CAST(COUNT(*) AS DOUBLE) > 0.02 AS above_threshold "
+            "FROM user_predictions GROUP BY __branch_id"
+        ),
     },
 }
 
@@ -76,7 +150,6 @@ def ensure_data():
 
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        # Quick check: do all branch dirs exist?
         all_present = all(
             (
                 LOCAL_DATA_DIR / "branches" / e["variant"] / "user_predictions.parquet"
@@ -93,7 +166,6 @@ def ensure_data():
     print("Local data not found. Downloading from S3...")
     s3 = pafs.S3FileSystem()
 
-    # Download manifest
     manifest_s3 = f"{S3_BUCKET}/{S3_PREFIX}/manifest.json"
     with s3.open_input_stream(manifest_s3) as f:
         manifest = json.loads(f.read().decode())
@@ -101,7 +173,6 @@ def ensure_data():
     LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
-    # Download shared table
     shared_dir = LOCAL_DATA_DIR / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
     shared_s3 = f"{S3_BUCKET}/{S3_PREFIX}/shared/ecommerce_users.parquet"
@@ -109,7 +180,6 @@ def ensure_data():
     pq.write_table(table, shared_dir / "ecommerce_users.parquet")
     print(f"  Downloaded ecommerce_users ({table.num_rows} rows)")
 
-    # Download branch tables
     for entry in manifest["branches"]:
         vname = entry["variant"]
         branch_dir = LOCAL_DATA_DIR / "branches" / vname
@@ -129,77 +199,72 @@ def load_branch_names(manifest):
 
 
 # ---------------------------------------------------------------------------
-# Engine implementations (local parquet, no bauplan dependency)
+# Engine: ad hoc (per-branch DataFusion contexts)
 # ---------------------------------------------------------------------------
+# Each branch gets its own SessionContext with register_parquet().
+# Branches run in a ThreadPoolExecutor(max_workers=2) -- limited parallelism
+# to represent a realistic resource-constrained deployment.  Each DataFusion
+# context internally parallelizes across all CPU cores for its single-branch
+# query.
 
 
 def run_adhoc(sql: str, branch_names: list[str], shared_path: Path, branches_dir: Path):
-    """Per-branch DataFusion contexts — the ad hoc engine."""
-    all_batches = []
-    plan_ns = 0
-    exec_ns = 0
+    """Per-branch DataFusion contexts with limited parallelism."""
+    from multiverse import run_adhoc_parallel
 
-    for branch in branch_names:
+    def _build_ctx(branch):
         branch_parquet = branches_dir / branch / "user_predictions.parquet"
-
-        t0 = time.perf_counter_ns()
         ctx = datafusion.SessionContext()
         ctx.register_parquet("user_predictions", str(branch_parquet))
         ctx.register_parquet("ecommerce_users", str(shared_path))
-        plan_ns += time.perf_counter_ns() - t0
+        return ctx
 
-        t0 = time.perf_counter_ns()
-        branch_sql = f"SELECT *, '{branch}' AS __branch_id FROM ({sql})"
-        batches = ctx.sql(branch_sql).collect()
-        all_batches.extend(batches)
-        exec_ns += time.perf_counter_ns() - t0
+    all_batches, exec_ms = run_adhoc_parallel(
+        branch_names, _build_ctx, sql, max_workers=2
+    )
 
     t0 = time.perf_counter_ns()
-    if all_batches:
-        combined = pa.Table.from_batches(all_batches)
-    else:
-        combined = None
+    combined = pa.Table.from_batches(all_batches) if all_batches else None
     concat_ns = time.perf_counter_ns() - t0
 
     return {
-        "plan_ms": round(plan_ns / 1_000_000),
-        "exec_ms": round(exec_ns / 1_000_000),
+        "plan_ms": 0,
+        "exec_ms": exec_ms,
         "concat_ms": round(concat_ns / 1_000_000),
         "rows": combined.num_rows if combined else 0,
     }
 
 
+# ---------------------------------------------------------------------------
+# Engine: native unified plan (pure Rust, no FFI)
+# ---------------------------------------------------------------------------
+# Uses query_native() from the multiverse_provider crate.  This function
+# creates a Rust DataFusion SessionContext, registers a MultiverseTableProvider
+# (one ListingTable per branch wrapped in a UnionExec with __branch_id), and
+# registers shared tables as plain ListingTables -- all within a single Rust
+# process.  No FFI boundary means the optimizer has full visibility:
+#   - Predicate pushdown into parquet (row group pruning)
+#   - Projection pushdown (only needed columns read)
+#   - Shared-table reuse (CTE / hash-join build side computed once)
+
+
 def run_native_multiverse(
     sql: str, branch_names: list[str], shared_path: Path, branches_dir: Path
 ):
-    """Single DataFusion context with LocalMultiverseTable — lazy parquet reads.
+    """Pure Rust DataFusion -- no FFI boundary."""
+    from multiverse_provider import query_native
 
-    Uses LocalMultiverseTable (Rust ListingTable per branch) so DataFusion
-    only reads parquet data when the query actually executes, matching the
-    lazy behaviour of the ad hoc engine's register_parquet().
-    """
-    from multiverse_provider import LocalMultiverseTable
-
-    # Plan phase: create LocalMultiverseTable with file paths (no data loaded yet)
     t0 = time.perf_counter_ns()
 
-    branch_paths = []
-    for branch in branch_names:
-        branch_parquet = branches_dir / branch / "user_predictions.parquet"
-        branch_paths.append((branch, str(branch_parquet)))
+    branch_paths = [
+        (branch, str(branches_dir / branch / "user_predictions.parquet"))
+        for branch in branch_names
+    ]
+    shared_tables = [("ecommerce_users", str(shared_path))]
 
-    mv_table = LocalMultiverseTable(branch_paths)
-    ctx = datafusion.SessionContext()
-    ctx.register_table("user_predictions", mv_table)
-    ctx.register_parquet("ecommerce_users", str(shared_path))
-    plan_ns = time.perf_counter_ns() - t0
-
-    # Exec phase: single query across all branches
-    t0 = time.perf_counter_ns()
-    batches = ctx.sql(sql).collect()
+    batches = query_native(sql, branch_paths, shared_tables)
     exec_ns = time.perf_counter_ns() - t0
 
-    # Concat phase
     t0 = time.perf_counter_ns()
     if batches:
         combined = pa.Table.from_batches(batches)
@@ -208,22 +273,27 @@ def run_native_multiverse(
     concat_ns = time.perf_counter_ns() - t0
 
     return {
-        "plan_ms": round(plan_ns / 1_000_000),
+        "plan_ms": 0,
         "exec_ms": round(exec_ns / 1_000_000),
         "concat_ms": round(concat_ns / 1_000_000),
         "rows": combined.num_rows if combined else 0,
     }
 
 
+# ---------------------------------------------------------------------------
+# Engine: native short-circuit (boolean early termination)
+# ---------------------------------------------------------------------------
+# For boolean queries, the supervaluationary verdict can be determined without
+# scanning all branches: once two branches disagree (one true, one false), the
+# answer is a truth glut regardless of the remaining branches.  This is an
+# optimization with no classical analogue -- it exploits the non-classical
+# semantics to skip work.
+
+
 def run_native_shortcircuit(
     sql: str, branch_names: list[str], shared_path: Path, branches_dir: Path
 ):
-    """Parallel per-branch boolean evaluation with early termination.
-
-    For boolean queries, the supervaluationary verdict can be determined
-    without scanning all branches: once two branches disagree, the answer
-    is a truth glut regardless of the remaining branches.
-    """
+    """Parallel per-branch boolean evaluation with early termination."""
     cancel = threading.Event()
     seen_true = threading.Event()
     seen_false = threading.Event()
@@ -549,13 +619,13 @@ def generate_paper_charts(all_results, branch_counts, output_dir: Path):
                 and r["branches"] == b
             ]
             if not vals:
-                return None  # incomplete data for this series
+                return None
             medians.append(median(vals))
         return medians
 
     query_labels = {
         "q1_count": "Q1: COUNT (single table)",
-        "q2_join": "Q2: COUNT with JOIN",
+        "q2_join": "Q2: COUNT with JOIN + windows",
         "q4_bool": "Q4: Boolean threshold",
     }
 

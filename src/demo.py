@@ -70,7 +70,7 @@ def run_pipeline(client, project_dir, branch_name, dry_run, sample_size):
     return branch_name, status, error
 
 
-MIN_SAMPLE_SIZE = 1_000_000
+MIN_SAMPLE_SIZE = 2_000_000
 
 
 def launch(dry_run=False, sample_size=0, max_variants=0, max_workers=4):

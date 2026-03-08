@@ -10,10 +10,14 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
+import datafusion
 import pyarrow as pa
 from dotenv import load_dotenv
 
@@ -85,6 +89,40 @@ def parse_operator_bytes(plan_text: str) -> int:
         unit = m.group(2).strip().lower()
         total += int(value * _UNIT_MULTIPLIER.get(unit, 1))
     return total
+
+
+def run_adhoc_parallel(
+    branches: list[str],
+    build_context: Callable[[str], datafusion.SessionContext],
+    sql: str,
+    max_workers: int = 10,
+) -> tuple[list[pa.RecordBatch], int]:
+    """Run per-branch SQL in parallel, tagging each result with __branch_id.
+
+    Args:
+        branches: Branch identifiers.
+        build_context: Called with a branch name, returns a DataFusion
+            SessionContext with that branch's tables registered.
+        sql: The user SQL (without __branch_id — it's added automatically).
+        max_workers: Thread pool size cap.
+
+    Returns:
+        (all_batches, exec_ms) — the raw RecordBatches and wall-clock time.
+    """
+    def _run(branch: str) -> list[pa.RecordBatch]:
+        ctx = build_context(branch)
+        branch_sql = f"SELECT *, '{branch}' AS __branch_id FROM ({sql})"
+        return ctx.sql(branch_sql).collect()
+
+    t0 = time.perf_counter_ns()
+    all_batches: list[pa.RecordBatch] = []
+    n = min(max_workers, len(branches)) or 1
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {pool.submit(_run, b): b for b in branches}
+        for future in as_completed(futures):
+            all_batches.extend(future.result())
+    exec_ms = round((time.perf_counter_ns() - t0) / 1_000_000)
+    return all_batches, exec_ms
 
 
 class MultiverseEngine(ABC):

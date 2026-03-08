@@ -132,3 +132,52 @@ class TestNonStrictMode:
                 schemas=SCHEMAS,
                 strict=False,
             )
+
+
+class TestNativeGlobalLimitGuardrail:
+    """Native engine must reject global LIMIT on set queries (top-K bug)."""
+
+    def test_global_limit_rejected(self):
+        """ORDER BY + LIMIT without PARTITION BY __branch_id → rejected."""
+        sql = (
+            "SELECT __branch_id, user_id FROM user_predictions "
+            "WHERE predicted_label = 1 "
+            "ORDER BY conversion_prob DESC LIMIT 50"
+        )
+        with pytest.raises(UnsupportedQueryError, match="Global LIMIT"):
+            classify(sql, schemas=SCHEMAS, strict=False, engine="native")
+
+    def test_window_partition_accepted(self):
+        """Correct pattern: ROW_NUMBER PARTITION BY __branch_id → accepted."""
+        sql = (
+            "WITH ranked AS ("
+            "  SELECT __branch_id, user_id, "
+            "  ROW_NUMBER() OVER (PARTITION BY __branch_id ORDER BY conversion_prob DESC) AS rn "
+            "  FROM user_predictions WHERE predicted_label = 1"
+            ") "
+            "SELECT __branch_id, user_id FROM ranked WHERE rn <= 50"
+        )
+        # strict=False because native engine uses CTEs/windows
+        shape = classify(sql, schemas=SCHEMAS, strict=False, engine="native")
+        assert shape.result_type == ResultType.SET
+        assert shape.set_column == "user_id"
+
+    def test_adhoc_global_limit_ok(self):
+        """Ad hoc engine runs per-branch, so global LIMIT is fine."""
+        sql = (
+            "SELECT user_id FROM user_predictions "
+            "WHERE predicted_label = 1 "
+            "ORDER BY conversion_prob DESC LIMIT 50"
+        )
+        shape = classify(sql, schemas=SCHEMAS, strict=True, engine="adhoc")
+        assert shape.result_type == ResultType.SET
+        assert shape.max_rows_hint == 50
+
+    def test_native_set_without_limit_ok(self):
+        """Native set query without ORDER BY + LIMIT is fine."""
+        sql = (
+            "SELECT __branch_id, user_id FROM user_predictions "
+            "WHERE predicted_label = 1"
+        )
+        shape = classify(sql, schemas=SCHEMAS, strict=False, engine="native")
+        assert shape.result_type == ResultType.SET

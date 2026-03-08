@@ -21,6 +21,7 @@ from multiverse import (
     QueryResult,
     get_parquet_files,
     parse_operator_bytes,
+    run_adhoc_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,50 +39,33 @@ class NaiveMultiverse(MultiverseEngine):
     def __init__(self, metadata_by_branch: BranchMetadata) -> None:
         super().__init__()
         self._metadata_by_branch = metadata_by_branch
+        self._s3_fs: pafs.S3FileSystem | None = None
 
-    # --- Iceberg → DataFusion registration ---
+    def _get_s3_fs(self) -> pafs.S3FileSystem:
+        if self._s3_fs is None:
+            self._s3_fs = pafs.S3FileSystem()
+        return self._s3_fs
 
-    def _register_branch(
-        self,
-        ctx: datafusion.SessionContext,
-        tables: dict[str, str],
-        s3_fs: pafs.S3FileSystem | None = None,
-    ) -> None:
-        """Register all tables for a single branch under their original names."""
-        if s3_fs is None:
-            s3_fs = pafs.S3FileSystem()
-
+    def _build_branch_context(self, branch: str) -> datafusion.SessionContext:
+        """Build a DataFusion context with all tables for a single branch."""
+        tables = self._metadata_by_branch[branch]
+        s3_fs = self._get_s3_fs()
+        ctx = datafusion.SessionContext()
         for table_name, metadata_location in tables.items():
             file_paths = get_parquet_files(metadata_location)
             stripped = [p.replace("s3://", "", 1) for p in file_paths]
             dataset = ds.dataset(stripped, format="parquet", filesystem=s3_fs)
             ctx.register_dataset(table_name, dataset)
-
-    # --- Main query flow ---
+        return ctx
 
     def _query(self, sql: str, branches: list[str]) -> QueryResult:
-        """Execute SQL across all branches — one DataFusion context per branch."""
+        """Execute SQL across all branches in parallel."""
         if not self._metadata_by_branch:
             return None, {}
 
-        s3_fs = pafs.S3FileSystem()
-        all_batches: list[pa.RecordBatch] = []
-        plan_ns = 0
-        exec_ns = 0
-
-        for branch in branches:
-            tables = self._metadata_by_branch[branch]
-
-            t0 = time.perf_counter_ns()
-            ctx = datafusion.SessionContext()
-            self._register_branch(ctx, tables, s3_fs)
-            plan_ns += time.perf_counter_ns() - t0
-
-            t0 = time.perf_counter_ns()
-            branch_sql = f"SELECT *, '{branch}' AS __branch_id FROM ({sql})"
-            batches = ctx.sql(branch_sql).collect()
-            all_batches.extend(batches)
-            exec_ns += time.perf_counter_ns() - t0
+        all_batches, exec_ms = run_adhoc_parallel(
+            branches, self._build_branch_context, sql
+        )
 
         if not all_batches:
             return None, {}
@@ -93,27 +77,20 @@ class NaiveMultiverse(MultiverseEngine):
         if combined.num_rows == 0:
             return None, {}
 
-        self.stats.plan_ms = round(plan_ns / 1_000_000)
-        self.stats.exec_ms = round(exec_ns / 1_000_000)
+        self.stats.exec_ms = exec_ms
         self.stats.concat_ms = round(concat_ns / 1_000_000)
 
         return combined, {}
-
-    # --- Benchmark: EXPLAIN ANALYZE pass ---
 
     def _explain_analyze(
         self, sql: str, branches: list[str]
     ) -> tuple[int, dict[str, int]]:
         """Re-execute each branch with EXPLAIN ANALYZE to collect operator bytes."""
-        s3_fs = pafs.S3FileSystem()
         total = 0
         per_branch: dict[str, int] = {}
 
         for branch in branches:
-            tables = self._metadata_by_branch[branch]
-            ctx = datafusion.SessionContext()
-            self._register_branch(ctx, tables, s3_fs)
-
+            ctx = self._build_branch_context(branch)
             branch_sql = f"SELECT *, '{branch}' AS __branch_id FROM ({sql})"
             try:
                 analyze_df = ctx.sql(f"EXPLAIN ANALYZE {branch_sql}")

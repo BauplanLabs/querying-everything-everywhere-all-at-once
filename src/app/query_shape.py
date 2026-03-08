@@ -3,7 +3,7 @@ Query shape classifier.
 
 Inspects the output schema and SQL text of a user query to determine
 its result type (NUMBER, BOOLEAN, SET) and guard against patterns that
-the ad hoc UNION ALL engine cannot handle.
+the ad hoc engine cannot handle.
 """
 
 import re
@@ -46,6 +46,9 @@ _WINDOW_PATTERN = re.compile(r"\bOVER\s*\(", re.IGNORECASE)
 _GROUP_BY_PATTERN = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 _ORDER_BY_PATTERN = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
 _LIMIT_PATTERN = re.compile(r"\bLIMIT\s+(\d+)", re.IGNORECASE)
+_PARTITION_BY_BRANCH_PATTERN = re.compile(
+    r"\bPARTITION\s+BY\s+__branch_id\b", re.IGNORECASE
+)
 
 
 @dataclass
@@ -59,6 +62,10 @@ class _SQLFeatures:
     has_cte: bool
     has_window: bool
     limit_val: int | None
+
+
+def _has_partition_by_branch(sql: str) -> bool:
+    return bool(_PARTITION_BY_BRANCH_PATTERN.search(sql))
 
 
 def _extract_sql_features(sql: str) -> _SQLFeatures:
@@ -220,4 +227,30 @@ def classify(
         )
 
     col_name, col_type = output_cols[0]
-    return _infer_result_type(col_name, col_type, features, strict)
+    shape = _infer_result_type(col_name, col_type, features, strict)
+
+    # Native engine guardrail: a global LIMIT on a SET query returns top-K
+    # across ALL branches instead of top-K per branch.  The correct pattern
+    # is ROW_NUMBER() OVER (PARTITION BY __branch_id ...).
+    if (
+        engine == "native"
+        and shape.result_type == ResultType.SET
+        and features.has_order_by
+        and features.limit_val is not None
+        and not _has_partition_by_branch(sql)
+    ):
+        raise UnsupportedQueryError(
+            reason="Global LIMIT on a set query in native mode returns top-K across all branches, not per branch.",
+            hint=(
+                "Use ROW_NUMBER() OVER (PARTITION BY __branch_id ORDER BY ...) "
+                "to get top-K per branch. Example:\n"
+                "  WITH ranked AS (\n"
+                "    SELECT __branch_id, user_id,\n"
+                "           ROW_NUMBER() OVER (PARTITION BY __branch_id ORDER BY conversion_prob DESC) AS rn\n"
+                "    FROM user_predictions WHERE predicted_label = 1\n"
+                "  )\n"
+                "  SELECT __branch_id, user_id FROM ranked WHERE rn <= 50"
+            ),
+        )
+
+    return shape

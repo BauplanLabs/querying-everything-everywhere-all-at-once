@@ -100,6 +100,60 @@ fn expr_references_branch_id(expr: &Expr) -> bool {
     format!("{expr}").contains("__branch_id")
 }
 
+/// Extract branch IDs from __branch_id filter expressions for branch pruning.
+///
+/// Recognises patterns like:
+///   - `__branch_id = 'x'`          → Some({"x"})
+///   - `__branch_id IN ('x', 'y')`  → Some({"x", "y"})
+///
+/// Returns None if no __branch_id filter is found (meaning: keep all branches).
+fn extract_branch_ids(filters: &[Expr]) -> Option<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+
+    for expr in filters {
+        match expr {
+            // __branch_id = 'literal'
+            Expr::BinaryExpr(datafusion_expr::expr::BinaryExpr {
+                left, op: datafusion_expr::Operator::Eq, right,
+            }) => {
+                let is_branch_col = |e: &Expr| matches!(
+                    e, Expr::Column(c) if c.name == "__branch_id"
+                );
+                let as_str = |e: &Expr| match e {
+                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.clone()),
+                    _ => None,
+                };
+                if is_branch_col(left) {
+                    if let Some(v) = as_str(right) {
+                        return Some(HashSet::from([v]));
+                    }
+                }
+                if is_branch_col(right) {
+                    if let Some(v) = as_str(left) {
+                        return Some(HashSet::from([v]));
+                    }
+                }
+            }
+            // __branch_id IN ('a', 'b', ...)
+            Expr::InList(datafusion_expr::expr::InList {
+                expr: box_expr, list, negated: false,
+            }) => {
+                if matches!(box_expr.as_ref(), Expr::Column(c) if c.name == "__branch_id") {
+                    let ids: Vec<String> = list.iter().filter_map(|e| match e {
+                        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(s.clone()),
+                        _ => None,
+                    }).collect();
+                    if !ids.is_empty() {
+                        return Some(ids.into_iter().collect());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[async_trait]
 impl TableProvider for MultiverseTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -114,6 +168,29 @@ impl TableProvider for MultiverseTableProvider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion_common::Result<Vec<datafusion_expr::TableProviderFilterPushDown>> {
+        use datafusion_expr::TableProviderFilterPushDown;
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if expr_references_branch_id(f) {
+                    // __branch_id filters are handled via branch pruning in scan(),
+                    // but we report Inexact so DataFusion keeps a safety FilterExec
+                    // in case our pruning doesn't cover all edge cases.
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    // Data filters are forwarded to inner providers which may
+                    // push them into the parquet reader for row-group pruning.
+                    // Inexact = "we'll try, but keep a FilterExec above too."
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn datafusion::catalog::Session,
@@ -121,6 +198,10 @@ impl TableProvider for MultiverseTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Branch pruning: if any filter constrains __branch_id, only include
+        // the matching branches in the UnionExec.
+        let allowed_branches = extract_branch_ids(filters);
+
         // Strip filters that reference __branch_id — inner providers don't
         // have that column and would reject or mishandle such predicates.
         let inner_filters: Vec<Expr> = filters
@@ -152,6 +233,12 @@ impl TableProvider for MultiverseTableProvider {
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.branches.len());
 
         for (branch_id, inner_provider) in &self.branches {
+            // Branch pruning: skip branches not in the allowed set
+            if let Some(ref allowed) = allowed_branches {
+                if !allowed.contains(branch_id) {
+                    continue;
+                }
+            }
             let branch_schema = inner_provider.schema();
 
             // Build mapping: canonical index -> this branch's index
@@ -211,6 +298,15 @@ impl TableProvider for MultiverseTableProvider {
 
             let projection_plan = ProjectionExec::try_new(exprs, inner_plan)?;
             plans.push(Arc::new(projection_plan));
+        }
+
+        // If branch pruning removed all branches, return an empty MemTable scan
+        // with the correct schema so the query returns zero rows.
+        if plans.is_empty() {
+            let empty = MemTable::try_new(self.schema.clone(), vec![])?;
+            return empty
+                .scan(state, projection, &[], limit)
+                .await;
         }
 
         let union_arc = UnionExec::try_new(plans)?;
@@ -615,6 +711,148 @@ impl LocalMultiverseTable {
         use arrow::pyarrow::ToPyArrow;
         Ok(schema.to_pyarrow(py)?.unbind())
     }
+}
+
+/// Execute SQL natively in Rust against a MultiverseTableProvider — no FFI.
+///
+/// Creates a SessionContext, registers the multiverse table (ListingTable per
+/// branch) and any shared tables directly, then runs the query.  The entire
+/// plan lives in one Rust process so DataFusion's optimizer has full visibility
+/// for predicate pushdown, projection pruning, etc.
+///
+/// Returns a list of PyArrow RecordBatches.
+#[pyfunction]
+#[pyo3(signature = (sql, branch_paths, shared_tables=None))]
+pub fn query_native(
+    py: Python<'_>,
+    sql: &str,
+    branch_paths: Vec<(String, String)>,
+    shared_tables: Option<Vec<(String, String)>>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    use arrow::pyarrow::ToPyArrow;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    use datafusion::execution::context::SessionContext;
+
+    if branch_paths.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "at least one branch is required",
+        ));
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to create tokio runtime: {}",
+            e
+        ))
+    })?;
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+
+    // Build ListingTable per branch for the multiverse table
+    let mut branches: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
+    for (branch_id, file_path) in &branch_paths {
+        let table_url = ListingTableUrl::parse(file_path).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid path '{}': {}",
+                file_path, e
+            ))
+        })?;
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        let config = rt
+            .block_on(async {
+                ListingTableConfig::new(table_url)
+                    .with_listing_options(listing_options)
+                    .infer_schema(&state)
+                    .await
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to infer schema for branch '{}': {}",
+                    branch_id, e
+                ))
+            })?;
+        let listing_table = ListingTable::try_new(config).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to create ListingTable for branch '{}': {}",
+                branch_id, e
+            ))
+        })?;
+        branches.push((branch_id.clone(), Arc::new(listing_table)));
+    }
+
+    // Create MultiverseTableProvider and register it — no FFI, native registration
+    let provider = MultiverseTableProvider::try_new(branches)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    rt.block_on(async {
+        ctx.register_table("user_predictions", Arc::new(provider))
+    })
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to register multiverse table: {}",
+            e
+        ))
+    })?;
+
+    // Register shared tables as ListingTables (same native path, no FFI)
+    if let Some(shared) = &shared_tables {
+        for (table_name, file_path) in shared {
+            let table_url = ListingTableUrl::parse(file_path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid shared table path '{}': {}",
+                    file_path, e
+                ))
+            })?;
+            let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+            let config = rt
+                .block_on(async {
+                    ListingTableConfig::new(table_url)
+                        .with_listing_options(listing_options)
+                        .infer_schema(&state)
+                        .await
+                })
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to infer schema for shared table '{}': {}",
+                        table_name, e
+                    ))
+                })?;
+            let listing_table = ListingTable::try_new(config).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to create ListingTable for shared table '{}': {}",
+                    table_name, e
+                ))
+            })?;
+            rt.block_on(async {
+                ctx.register_table(table_name, Arc::new(listing_table))
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "failed to register shared table '{}': {}",
+                    table_name, e
+                ))
+            })?;
+        }
+    }
+
+    // Execute the query
+    let batches: Vec<RecordBatch> = rt
+        .block_on(async { ctx.sql(sql).await?.collect().await })
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("query failed: {}", e))
+        })?;
+
+    // Convert to PyArrow
+    let py_batches: Vec<Py<PyAny>> = batches
+        .into_iter()
+        .map(|batch: RecordBatch| Ok(batch.to_pyarrow(py)?.unbind()))
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok(py_batches)
 }
 
 // ---- Rust unit tests ----
