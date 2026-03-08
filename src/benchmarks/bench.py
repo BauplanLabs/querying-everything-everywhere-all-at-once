@@ -26,7 +26,7 @@ Produces JSONL output for paper charts and a printed summary table.
 Usage:
     uv run python src/benchmarks/bench.py
     uv run python src/benchmarks/bench.py --max-branches 16 --runs 3
-    uv run python src/benchmarks/bench.py --query q2_join --engine native
+    uv run python src/benchmarks/bench.py --query q3_join --engine native
     uv run python src/benchmarks/bench.py --paper   # generate PDF charts
 """
 
@@ -63,7 +63,7 @@ LOCAL_DATA_DIR = Path(__file__).parent / "data"
 #     (RepartitionExec, hash partitioning for GROUP BY) that exceeds
 #     the actual work.
 #
-# Q2: JOIN between branch-specific predictions and a shared 3M-row
+# Q3: JOIN between branch-specific predictions and a shared 3M-row
 #     dimension table with expensive window functions.  Native wins
 #     because it computes the CTE once and reuses the hash-join build
 #     side, while ad hoc recomputes it per branch.
@@ -87,7 +87,7 @@ QUERIES = {
             "GROUP BY __branch_id"
         ),
     },
-    "q2_join": {
+    "q3_join": {
         "label": "COUNT buyers in large segments (JOIN + window functions)",
         "type": "number",
         "adhoc": (
@@ -625,14 +625,14 @@ def generate_paper_charts(all_results, branch_counts, output_dir: Path):
 
     query_labels = {
         "q1_count": "Q1: COUNT (single table)",
-        "q2_join": "Q2: COUNT with JOIN + windows",
+        "q3_join": "Q3: COUNT with JOIN + windows",
         "q4_bool": "Q4: Boolean threshold",
     }
 
     # --- Chart 1: Latency scaling (all queries, both engines) ---
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5), sharey=False)
 
-    for ax, qid in zip(axes, ["q1_count", "q2_join", "q4_bool"]):
+    for ax, qid in zip(axes, ["q1_count", "q3_join", "q4_bool"]):
         adhoc_med = get_medians(qid, "adhoc")
         native_med = get_medians(qid, "native")
 
@@ -657,10 +657,10 @@ def generate_paper_charts(all_results, branch_counts, output_dir: Path):
 
     # --- Chart 2: Speedup (ad hoc / native) ---
     fig, ax = plt.subplots(figsize=(5, 3.5))
-    colors = {"q1_count": "#2ca02c", "q2_join": "#1f77b4", "q4_bool": "#ff7f0e"}
-    markers = {"q1_count": "o", "q2_join": "s", "q4_bool": "^"}
+    colors = {"q1_count": "#2ca02c", "q3_join": "#1f77b4", "q4_bool": "#ff7f0e"}
+    markers = {"q1_count": "o", "q3_join": "s", "q4_bool": "^"}
 
-    for qid in ["q1_count", "q2_join", "q4_bool"]:
+    for qid in ["q1_count", "q3_join", "q4_bool"]:
         adhoc_med = get_medians(qid, "adhoc")
         native_med = get_medians(qid, "native")
         if adhoc_med and native_med:
