@@ -1,6 +1,6 @@
 # Querying Everything Everywhere All at Once
 
-Companion code for the demo paper *"Querying Everything Everywhere All at Once"* ([paper link forthcoming](https://github.com/BauplanLabs/querying-everything-everywhere-all-at-once)). For further background on supervaluationary semantics, the query engine internals, and formal details, consult the paper.
+Companion code for the demo paper *"Querying Everything Everywhere All at Once"* ([pre-print](https://arxiv.org/pdf/2603.13380)). For further background on supervaluationary semantics, the query engine internals, and formal details, consult the paper.
 
 ## The scenario
 
