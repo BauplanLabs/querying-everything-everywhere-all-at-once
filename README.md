@@ -1,6 +1,6 @@
 # Querying Everything Everywhere All at Once
 
-Companion code for the demo paper *"Querying Everything Everywhere All at Once"* ([pre-print](https://arxiv.org/pdf/2603.13380)). For further background on supervaluationary semantics, the query engine internals, and formal details, consult the paper.
+Companion code for the demo paper *"Querying Everything Everywhere All at Once"* ([original pre-print](https://arxiv.org/pdf/2603.13380), ACM CAIS SAO [version](https://bauplanlabs.github.io/SAO-workshop/papers/69.pdf)). For further background on supervaluationary semantics, the query engine internals, and formal details, consult the paper.
 
 ## The scenario
 
@@ -110,7 +110,6 @@ uv run pytest src/tests/ -v
 
 * **Single-column query semantics** — the supervaluation layer currently handles scalar (number, boolean) and single-column set results. Generalizing to multi-column result semantics is future work.
 * **Query parsing should be internalized in the native engine** — the current approach relies on the text-to-SQL LLM to modify the query for the native engine (the final query shape is the one in the benchmarks). Ideally, the engine itself would parse and rewrite arbitrary SQL to be branch-aware.
-* TBC
 
 ## License
 
